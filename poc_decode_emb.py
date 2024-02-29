@@ -6,6 +6,14 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 import datasets
 from modeling_llama import LlamaForCausalLM
 
+
+
+f(t1, .... tn) -> h 
+
+f(f) -> t1, .... tn
+
+
+
 import os 
 #model_name = 'meta-llama/Llama-2-7b-chat-hf'
 # model_name = 'google/gemma-2b-it'
@@ -64,11 +72,28 @@ model = get_peft_model(model, lora_config)
 model.print_trainable_parameters()
 doc_max_length = 16
 
+
+
+# # getting h aggregation
+# t1, .... tn <agg>
+
+# # using h  during training
+
+# inp:    <bos><emb>      t1, .... tn <eos>
+# labels: [-100] [-100]   t1, .... tn <eos>
+
+# # inference 
+# <bos><emb> 
+
+
 def collate_fn(examples):
     inp = [tokenizer.emb_token + ' '.join(e['content'].split(' ')[:doc_max_length]) + tokenizer.agg_token for e in examples]
     inp = tokenizer(inp, return_tensors='pt', padding=True)
+
+
     inp_label = [tokenizer.emb_token + ' '.join(e['content'].split(' ')[:doc_max_length]) + tokenizer.eos_token for e in examples]
     inp_label = tokenizer(inp_label, return_tensors='pt', padding=True)
+
     label = inp_label['input_ids']
     label[label == tokenizer.emb_token_id] = -100
     label[label == tokenizer.bos_token_id] = -100
