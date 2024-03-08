@@ -495,7 +495,6 @@ class LlamaFlashAttention2(LlamaAttention):
 
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
         attn_output = self.o_proj(attn_output)
-        #print(attn_output[0])
         if not output_attentions:
             attn_weights = None
 
@@ -660,13 +659,9 @@ class LlamaSdpaAttention(LlamaAttention):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        if is_causal:
-            causal_mask = attention_mask
-            if attention_mask is not None and cache_position is not None:
-                causal_mask = causal_mask[:, :, cache_position, : key_states.shape[-2]]
-        else:
-            causal_mask = attention_mask
-        #print(causal_mask)
+        causal_mask = attention_mask
+        if attention_mask is not None and cache_position is not None:
+            causal_mask = causal_mask[:, :, cache_position, : key_states.shape[-2]]
         # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
         # Reference: https://github.com/pytorch/pytorch/issues/112577.
         if query_states.device.type == "cuda" and causal_mask is not None:
@@ -687,7 +682,6 @@ class LlamaSdpaAttention(LlamaAttention):
         attn_output = attn_output.view(bsz, q_len, self.hidden_size)
 
         attn_output = self.o_proj(attn_output)
-        #print(attn_output[0])
         return attn_output, None, past_key_value
 
 LLAMA_ATTENTION_CLASSES = {
@@ -827,7 +821,7 @@ class LlamaPreTrainedModel(PreTrainedModel):
             causal_mask = torch.full(
                 (max_cache_len, max_cache_len), fill_value=True, device=self.device, dtype=torch.bool
             )
-            self.register_buffer("causal_mask", torch.triu(causal_mask, diagonal=1), persistent=False)
+            self.register_buffer("causal_mask", causal_mask, persistent=False)
 
         for layer in self.model.layers:
             device = layer.input_layernorm.weight.device
@@ -940,10 +934,12 @@ class LlamaModel(LlamaPreTrainedModel):
 
         # Register a causal mask to separate causal and padding mask creation. Merging happens in the attention class.
         # NOTE: This is not friendly with TorchScript, ONNX, ExportedProgram serialization for very large `max_position_embeddings`.
-        causal_mask = torch.full(
+        self.register_buffer("full_mask", torch.full(
+            (config.max_position_embeddings, config.max_position_embeddings), fill_value=False, dtype=torch.bool
+        ), persistent=False)
+        self.register_buffer("causal_mask", torch.triu(torch.full(
             (config.max_position_embeddings, config.max_position_embeddings), fill_value=True, dtype=torch.bool
-        )
-        self.register_buffer("causal_mask", torch.triu(causal_mask, diagonal=1), persistent=False)
+        ), diagonal=1), persistent=False)
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -1004,12 +1000,7 @@ class LlamaModel(LlamaPreTrainedModel):
 
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
-        if is_causal:
-            causal_mask = self._update_causal_mask(attention_mask, inputs_embeds)
-        else:
-            causal_mask = torch.full(
-                (input_ids.size(1), input_ids.size(1)), fill_value=True, dtype=torch.bool
-            ).to(input_ids.device)
+        causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, is_causal=is_causal)
         # embed positions
         hidden_states = inputs_embeds
 
@@ -1078,7 +1069,7 @@ class LlamaModel(LlamaPreTrainedModel):
     # KV cache is used. This is an issue for torch.compile which then recaptures cudagraphs at each decode steps due to the dynamic shapes.
     # (`recording cudagraph tree for symint key 13`, etc.), which is VERY slow. A workaround is `@torch.compiler.disable`, but this prevents using
     # `fullgraph=True`. See more context in https://github.com/huggingface/transformers/pull/29114
-    def _update_causal_mask(self, attention_mask, input_tensor):
+    def _update_causal_mask(self, attention_mask, input_tensor, is_causal=True):
         if self.config._attn_implementation == "flash_attention_2":
             if attention_mask is not None and 0.0 in attention_mask:
                 return attention_mask
@@ -1087,19 +1078,27 @@ class LlamaModel(LlamaPreTrainedModel):
         batch_size, seq_length = input_tensor.shape[:2]
         dtype = input_tensor.dtype
         device = input_tensor.device
+        
+        causal_mask = self.full_mask if not is_causal else self.causal_mask
 
         # support going beyond cached `max_position_embedding`
-        if seq_length > self.causal_mask.shape[-1]:
-            causal_mask = torch.full((2 * self.causal_mask.shape[-1], 2 * self.causal_mask.shape[-1]), fill_value=1)
-            self.register_buffer("causal_mask", torch.triu(causal_mask, diagonal=1), persistent=False)
+        if seq_length > causal_mask.shape[-1]:
+            causal_mask = torch.full((2 * causal_mask.shape[-1], 2 * causal_mask.shape[-1]), fill_value=0)
+            causal_mask = torch.triu(causal_mask, diagonal=1) if is_causal else causal_mask
+            if is_causal:
+                self.register_buffer("causal_mask", causal_mask, persistent=False)
+            else:
+                self.register_buffer("full_mask", causal_mask, persistent=False)
+            causal_mask = self.full_mask if not is_causal else self.causal_mask
 
         # We use the current dtype to avoid any overflows
         min_dtype = torch.finfo(dtype).min
-        causal_mask = self.causal_mask[None, None, :, :].repeat(batch_size, 1, 1, 1).to(dtype) * min_dtype
+        causal_mask = causal_mask[None, None, :, :].repeat(batch_size, 1, 1, 1).to(dtype) * min_dtype
 
         causal_mask = causal_mask.to(dtype=dtype, device=device)
         if attention_mask is not None and attention_mask.dim() == 2:
             mask_length = attention_mask.shape[-1]
+
             padding_mask = causal_mask[..., :mask_length].eq(0.0) * attention_mask[:, None, None, :].eq(0.0)
             causal_mask[..., :mask_length] = causal_mask[..., :mask_length].masked_fill(padding_mask, min_dtype)
 
@@ -1115,7 +1114,6 @@ class LlamaModel(LlamaPreTrainedModel):
                 # using left padding. This is required by F.scaled_dot_product_attention memory-efficient attention path.
                 # Details: https://github.com/pytorch/pytorch/issues/110213
                 causal_mask = causal_mask.mul(~torch.all(causal_mask == min_dtype, dim=-1, keepdim=True)).to(dtype)
-
         return causal_mask
 
 
